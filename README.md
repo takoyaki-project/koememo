@@ -1,1 +1,1 @@
-https://takoyaki-project.github.io/koememo/
+https://takoyaki-project.github.io/shoutoku-taishi/
