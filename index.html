@@ -230,6 +230,11 @@
     <button class="gear" id="gearBtn" aria-label="設定">⚙</button>
   </header>
 
+  <div class="pause-card" id="recoveryCard">
+    <p>送信できていない録音があります。<br>再送信して報告書を作成しますか？</p>
+    <button class="resume-btn" id="recoverBtn">再送信</button>
+  </div>
+
   <!-- 卓上時計風カード:どこをタップしても録音開始/停止 -->
   <section class="clock" id="clockCard" role="button" tabindex="0" aria-label="タップして録音を開始・停止">
     <div class="dial">
@@ -492,7 +497,8 @@ REIT=不動産投資信託。読みは「リート」
         noticeEl=$('notice'), historyEl=$('history'), countEl=$('count'),
         modalBg=$('modalBg'), keyInput=$('keyInput'), mailInput=$('sendMail'),
         toastEl=$('toast'), consentCheck=$('consentCheck'),
-        pauseCardEl=$('pauseCard'), resumeBtnEl=$('resumeBtn');
+        pauseCardEl=$('pauseCard'), resumeBtnEl=$('resumeBtn'),
+        recoveryCardEl=$('recoveryCard'), recoverBtnEl=$('recoverBtn');
 
   const R = 101, CIRC = 2 * Math.PI * R;
   const CHUNK_MS = 15 * 60 * 1000; // 15分ごとにチャンクを確定
@@ -506,8 +512,125 @@ REIT=不動産投資信託。読みは「リート」
   // 各チャンクは {idx, blob, status:'recorded'|'sending'|'done'|'failed', text, attempts, authError} で保持する。
   // 送信に失敗しても blob は破棄せず、復帰後・オンライン復帰後・停止後にまとめて再送する。
   let sessionActive=false, paused=false, ending=false;
-  let chunkList=[], rotateTimer=null, queuePromise=null;
+  let chunkList=[], rotateTimer=null, queuePromise=null, sessionId=null;
   const MAX_RETRY = 3, RETRY_DELAY_MS = 4000;
+
+  // ===== 永続化(IndexedDB) =====
+  // 確定したチャンクは音声Blob付きで即座にIndexedDBへ保存し、送信失敗・リロード・
+  // アプリ終了があっても失われないようにする。失敗しても録音自体は止めず、console.logのみに留める。
+  const DB_NAME = 'shotokutaishi_db', DB_VERSION = 1;
+  let dbPromise = null;
+  function openDB(){
+    if(dbPromise) return dbPromise;
+    dbPromise = new Promise((resolve, reject) => {
+      const req = indexedDB.open(DB_NAME, DB_VERSION);
+      req.onupgradeneeded = () => {
+        const db = req.result;
+        if(!db.objectStoreNames.contains('chunks')){
+          const store = db.createObjectStore('chunks', { keyPath:'key' });
+          store.createIndex('sessionId', 'sessionId', { unique:false });
+        }
+        if(!db.objectStoreNames.contains('sessions')){
+          db.createObjectStore('sessions', { keyPath:'sessionId' });
+        }
+      };
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
+    return dbPromise;
+  }
+  async function idbPut(storeName, value){
+    const db = await openDB();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(storeName, 'readwrite');
+      tx.objectStore(storeName).put(value);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  }
+  async function idbGetAll(storeName){
+    const db = await openDB();
+    return new Promise((resolve, reject) => {
+      const req = db.transaction(storeName, 'readonly').objectStore(storeName).getAll();
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
+  }
+  async function idbGetAllByIndex(storeName, indexName, value){
+    const db = await openDB();
+    return new Promise((resolve, reject) => {
+      const req = db.transaction(storeName, 'readonly').objectStore(storeName).index(indexName).getAll(value);
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
+  }
+
+  // チャンク1件を保存(done済みなら容量節約のため音声Blobは保存しない)
+  async function persistChunk(c){
+    try{
+      await idbPut('chunks', {
+        key: `${sessionId}_${c.idx}`, sessionId, idx: c.idx,
+        blob: c.status==='done' ? null : c.blob,
+        status: c.status, text: c.text, attempts: c.attempts, authError: c.authError
+      });
+    }catch(e){ console.log('[IndexedDB] チャンク保存に失敗', e); }
+  }
+  async function touchSession(){
+    try{
+      await idbPut('sessions', { sessionId, startTime, elapsedSec: Math.floor((Date.now()-startTime)/1000) });
+    }catch(e){ console.log('[IndexedDB] セッション情報の保存に失敗', e); }
+  }
+  // セッション完了・破棄時に、そのセッションのチャンク・セッションレコードを全削除する
+  async function clearSessionFromDB(sid){
+    try{
+      const db = await openDB();
+      await new Promise((resolve, reject) => {
+        const tx = db.transaction(['chunks','sessions'], 'readwrite');
+        const cursorReq = tx.objectStore('chunks').index('sessionId').openCursor(IDBKeyRange.only(sid));
+        cursorReq.onsuccess = e => { const cur=e.target.result; if(cur){ cur.delete(); cur.continue(); } };
+        tx.objectStore('sessions').delete(sid);
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => reject(tx.error);
+      });
+    }catch(e){ console.log('[IndexedDB] セッション削除に失敗', e); }
+  }
+
+  // 起動時:未完了セッションが残っていれば復旧バナーを出す
+  async function checkForRecovery(){
+    try{
+      const sessions = await idbGetAll('sessions');
+      if(!sessions.length) return;
+      sessions.sort((a,b)=>b.startTime-a.startTime);
+      const s = sessions[0];
+      const storedChunks = await idbGetAllByIndex('chunks','sessionId', s.sessionId);
+      if(!storedChunks.length){ await clearSessionFromDB(s.sessionId); return; }
+      showRecoveryBanner(s, storedChunks);
+    }catch(e){ console.log('[IndexedDB] 復旧チェックに失敗', e); }
+  }
+  function showRecoveryBanner(s, storedChunks){
+    recoveryCardEl.style.display = 'block';
+    recoverBtnEl.disabled = false;
+    recoverBtnEl.onclick = async () => {
+      recoverBtnEl.disabled = true; // 二度押し防止
+      recoveryCardEl.style.display = 'none';
+      await recoverSession(s, storedChunks);
+    };
+  }
+  // 保存されていたチャンクからchunkListを復元し、既存の送信→整形フローに合流する
+  async function recoverSession(s, storedChunks){
+    sessionId = s.sessionId;
+    lastDuration = s.elapsedSec || 0;
+    chunkList = storedChunks
+      .slice()
+      .sort((a,b)=>a.idx-b.idx)
+      .map(sc => ({
+        idx: sc.idx, blob: sc.blob,
+        status: sc.status==='done' ? 'done' : 'recorded', // 未完了分はもう一度送信させる
+        text: sc.text, attempts: 0, authError: false
+      }));
+    stateEl.textContent = '処理中…';
+    await finalizeSession();
+  }
 
   // ===== 時計表示 =====
   function pad(n){ return String(n).padStart(2,'0'); }
@@ -550,6 +673,7 @@ REIT=不動産投資信託。読みは「リート」
 
     sessionActive=true; paused=false; ending=false;
     chunkList=[];
+    sessionId = 'sess_' + Date.now() + '_' + Math.random().toString(36).slice(2,8);
     recording=true; startTime=Date.now();
     clockCard.classList.add('rec');
     colonEl.classList.remove('blink');   // 録音中はコロンが点滅を止める(操作者だけが分かる合図)
@@ -649,7 +773,10 @@ REIT=不動産投資信託。読みは「リート」
     }
 
     // 録音データの確保を最優先:送信の成否に関わらず、まず必ず'recorded'として保存する
-    chunkList.push({ idx, blob, status:'recorded', text:null, attempts:0, authError:false });
+    const c = { idx, blob, status:'recorded', text:null, attempts:0, authError:false };
+    chunkList.push(c);
+    persistChunk(c);   // IndexedDBへ保存(録音継続を優先し、完了を待たずに次のチャンクへ進む)
+    touchSession();
 
     if(ending){
       finalizeSession();
@@ -663,12 +790,16 @@ REIT=不動産投資信託。読みは「リート」
   function resetState(){ stateEl.textContent='画面に触れて録音を開始'; }
 
   function resetSessionState(){
+    const sidToClean = sessionId;
     sessionActive=false; paused=false; ending=false;
-    chunkList=[];
+    chunkList=[]; sessionId=null;
     mediaRecorder=null; stream=null;
     pauseCardEl.style.display='none';
     consentCheck.checked=false; // 録音1回ごとに同意を取り直す
     updateConsentUI();
+    if(sidToClean){
+      clearSessionFromDB(sidToClean).then(checkForRecovery); // 完了したセッションを片付け、他に残っているものがあれば続けて案内する
+    }
   }
 
   // ===== 文字起こし(Whisper) → 必要なら整形(Chat) =====
@@ -686,10 +817,11 @@ REIT=不動産投資信託。読みは「リート」
   // 1チャンク分をWhisperに送信する。直前チャンクの文字起こし末尾をpromptに連結し文脈をつなぐ。
   // 失敗してもchunkListからは削除せず、'failed'として保持する(最大MAX_RETRY回まで自動リトライ)。
   async function sendChunk(c){
-    if(c.blob.size<2000){ c.status='done'; c.text=''; return; } // 最終チャンクの端数など、極端に短いものは無視
+    if(c.blob.size<2000){ c.status='done'; c.text=''; await persistChunk(c); return; } // 最終チャンクの端数など、極端に短いものは無視
     if(c.blob.size>24*1024*1024){
       c.status='failed'; c.attempts=MAX_RETRY; // リトライしても改善しないため上限扱いにする
       notice('error', `チャンク${c.idx+1}の録音データが大きすぎます(上限は約25MB)。`);
+      await persistChunk(c);
       return;
     }
     c.status='sending';
@@ -715,7 +847,8 @@ REIT=不動産投資信託。読みは「リート」
       const data = await res.json();
       c.text = applyExactReplace((data.text||'').trim());
       c.status = 'done';
-      c.blob = null; // テキスト化できたら音声データは不要なので解放する
+      await persistChunk(c); // 保存してからメモリ上の音声Blobを解放する
+      c.blob = null;
     }catch(e){
       c.attempts++;
       if(e && e.status===401) c.authError = true;
@@ -726,6 +859,7 @@ REIT=不動産投資信託。読みは「リート」
         return;
       }
       c.status = 'failed';
+      await persistChunk(c);
     }
   }
 
@@ -773,6 +907,8 @@ REIT=不動産投資信託。読みは「リート」
 
   // 「再送信」ボタン: 失敗チャンクのリトライ回数をリセットしてもう一度送信を試みる
   async function manualRetry(){
+    const btn = $('manualRetryBtn');
+    if(btn) btn.disabled = true; // 二度押し防止
     for(const c of chunkList){ if(c.status==='failed') c.attempts=0; }
     clearNotice();
     await finalizeSession();
@@ -912,6 +1048,7 @@ REIT=不動産投資信託。読みは「リート」
 
   // ===== 初期化 =====
   renderHistory();
+  checkForRecovery(); // 前回終了時に送信できていない録音が残っていないか確認する
   if(!localStorage.getItem(KEY)) setTimeout(openModal, 400);
 })();
 </script>
