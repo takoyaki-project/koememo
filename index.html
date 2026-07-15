@@ -372,6 +372,9 @@
       '解約返戻金、解約控除費用、特別勘定、債券型、責任開始期、告知受領権、診査、' +
       'クーリング・オフ、払込猶予期間、失効取消期間、復活、指定代理請求、' +
       'リビング・ニーズ特約、無解約返戻金型、ご意向についてお話しします。',
+    // 第1層(whisperPrompt)を文字起こしAPIに送るかどうかのスイッチ。
+    // falseでもwhisperPromptの中身自体は保持したまま、送信だけを止める。
+    useWhisperPrompt: false,
 
     // 【第2層】機械置換テーブル。「誤: 正」。
     // 採用基準: 4文字以上／日常会話に絶対出ない／文脈に関係なく100%誤変換。
@@ -826,19 +829,21 @@ REIT=不動産投資信託。読みは「リート」
     }
     c.status='sending';
     const key = localStorage.getItem(KEY);
-    let promptText = DICTIONARY_CONFIG.whisperPrompt;
-    if(c.idx>0){
-      const prev = chunkList[c.idx-1];
-      const tail = ((prev && prev.text) || '').slice(-150);
-      if(tail) promptText += ' ' + tail;
-    }
     const fd = new FormData();
     fd.append('file', c.blob, `rec_${c.idx}.`+ext);
     // response_formatは未指定=デフォルトのjsonを使用。gpt-4o-mini-transcribeはjson/textのみ対応
     // (verbose_json/srt/vttはwhisper-1専用)なので、data.textを読むこの実装のままで互換。
     fd.append('model','gpt-4o-mini-transcribe');
     fd.append('language','ja');
-    fd.append('prompt', promptText);
+    if(DICTIONARY_CONFIG.useWhisperPrompt){
+      let promptText = DICTIONARY_CONFIG.whisperPrompt;
+      if(c.idx>0){
+        const prev = chunkList[c.idx-1];
+        const tail = ((prev && prev.text) || '').slice(-150);
+        if(tail) promptText += ' ' + tail;
+      }
+      fd.append('prompt', promptText);
+    }
     try{
       const res = await fetch('https://api.openai.com/v1/audio/transcriptions',{
         method:'POST', headers:{'Authorization':'Bearer '+key}, body:fd
